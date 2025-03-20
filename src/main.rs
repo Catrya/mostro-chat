@@ -13,8 +13,10 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Layout},
     style::{Color, Style},
+    style::palette::tailwind::{BLUE},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Tabs},
+    prelude::Stylize, 
     Terminal,
 };
 use std::{
@@ -50,14 +52,15 @@ struct Args {
 }
 
 struct App {
-    messages: Arc<Mutex<Vec<(Timestamp, PublicKey, String)>>>, // Store (timestamp, sender pubkey, message)
+    messages: Arc<Mutex<Vec<(Timestamp, PublicKey, String)>>>,
     input: String,
-    tx: Option<Sender<String>>,  // Only used in participant mode
-    sender_keys: Option<Keys>,   // Only used in participant mode
+    tx: Option<Sender<String>>,
+    sender_keys: Option<Keys>,
     shared_keys: Keys,
     shared_key_display: String,
-    is_observer: bool,           // Flag to indicate observer mode (with -k)
-    is_shared_key_visible: bool, // Flag to control visibility of the shared key
+    is_observer: bool,
+    is_shared_key_visible: bool,
+    selected_tab: usize,
 }
 
 impl App {
@@ -77,14 +80,14 @@ impl App {
             shared_keys,
             shared_key_display,
             is_observer,
-            is_shared_key_visible: false, // Initialize with shared key hidden
+            is_shared_key_visible: false,
+            selected_tab: 0,
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    // Parse arguments using clap
     let args = Args::parse();
 
     let shared_keys: Keys;
@@ -92,11 +95,9 @@ async fn main() -> io::Result<()> {
     let is_observer = args.shared_key.is_some();
 
     if let Some(shared_key_hex) = args.shared_key {
-        // Observer mode: Use the provided shared key
         let shared_secret_key = SecretKey::from_str(&shared_key_hex).expect("Invalid shared key");
         shared_keys = Keys::new(shared_secret_key);
     } else {
-        // Participant mode: Generate shared key from sender and receiver keys
         let sender_secret = args.sender_secret.expect("Sender secret is required");
         let receiver_pubkey_str = args.receiver_pubkey.expect("Receiver pubkey is required");
 
@@ -111,14 +112,12 @@ async fn main() -> io::Result<()> {
         shared_keys = Keys::new(shared_secret_key);
     }
 
-    // Init terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Set channel and messages
     let (tx, rx) = if !is_observer {
         let (tx, rx) = mpsc::channel(100);
         (Some(tx), Some(rx))
@@ -127,13 +126,11 @@ async fn main() -> io::Result<()> {
     };
     let messages = Arc::new(Mutex::new(Vec::new()));
 
-    // Create app and run Nostr client in background
     let app = App::new(messages.clone(), tx, sender_keys.clone(), shared_keys.clone(), is_observer);
     let nostr_handle = tokio::spawn(run_nostr(sender_keys, shared_keys, rx, messages.clone(), is_observer));
 
     let result = run_app(&mut terminal, app).await;
 
-    // Clean up
     nostr_handle.abort();
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -145,108 +142,131 @@ async fn main() -> io::Result<()> {
 async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App) -> io::Result<()> {
     loop {
         terminal.draw(|f| {
-            let chunks = Layout::vertical([
-                Constraint::Percentage(60), // Messages area
-                Constraint::Percentage(15), // Shared key area
-                Constraint::Percentage(10), // Shared public key area
-                Constraint::Percentage(15), // Input area
-            ])
-            .split(f.area());
+            let vertical = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]);
+            let [tabs_area, body_area] = vertical.areas(f.area());
 
-            // Get the current time in seconds since the UNIX epoch
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("Error getting current time")
-                .as_secs();
-
-            // Filter messages from the last N seconds
-            let messages = app.messages.lock().expect("Error locking messages");
-            let recent_messages: Vec<String> = messages
+            let tab_titles = ["Messages", "Keys"]
                 .iter()
-                .filter(|(timestamp, _, _)| now - timestamp.as_u64() <= N_SECONDS)
-                .map(|(_, pubkey, msg)| {
-                    if app.is_observer {
-                        // In observer mode, always show the inner_event pubkey
-                        format!("{}: {}", pubkey.to_string(), msg)
+                .map(|t| Line::from(*t).bold())
+                .collect::<Vec<Line>>();
+
+            let tabs = Tabs::new(tab_titles)
+                .block(Block::bordered()
+                    .title_top(Line::from(" Mostro-Chat ").alignment(Alignment::Left))
+                    .title_top(Line::from(Span::raw("Esc to exit").style(Style::new().fg(Color::Green))).alignment(Alignment::Right))
+                )
+                .select(app.selected_tab)
+                .highlight_style(Style::new().fg(BLUE.c400));
+
+            f.render_widget(tabs, tabs_area);
+
+           
+
+            match app.selected_tab {
+                0 => {
+                    let chunks = Layout::vertical([
+                        Constraint::Percentage(80),
+                        Constraint::Percentage(20),
+                    ])
+                    .split(body_area);
+
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("Error getting current time")
+                        .as_secs();
+
+                    let messages = app.messages.lock().expect("Error locking messages");
+                    let recent_messages: Vec<String> = messages
+                        .iter()
+                        .filter(|(timestamp, _, _)| now - timestamp.as_u64() <= N_SECONDS)
+                        .map(|(_, pubkey, msg)| {
+                            if app.is_observer {
+                                format!("{}: {}", pubkey.to_string(), msg)
+                            } else {
+                                if Some(*pubkey) == app.sender_keys.as_ref().map(|k| k.public_key()) {
+                                    format!("You: {}", msg)
+                                } else {
+                                    format!("{}: {}", pubkey.to_string(), msg)
+                                }
+                            }
+                        })
+                        .collect();
+
+                    let lines: Vec<Line> = recent_messages
+                        .iter()
+                        .map(|msg| Line::from(Span::raw(msg)))
+                        .collect();
+                    let messages_widget = Paragraph::new(lines)
+                        .block(
+                            Block::default()
+                                .title_top(Line::from("Messages").alignment(Alignment::Left))
+                                .title_style(Style::new().fg(BLUE.c400))
+                                .borders(Borders::ALL)
+                        );
+                    f.render_widget(messages_widget, chunks[0]);
+
+                    let input = Paragraph::new(app.input.as_str())
+                        .style(Style::default().fg(Color::Yellow))
+                        .block(Block::default().title("Input").borders(Borders::ALL));
+                    f.render_widget(input, chunks[1]);
+                }
+                1 => {
+                    let chunks = Layout::vertical([
+                        Constraint::Percentage(50),
+                        Constraint::Percentage(50),
+                    ])
+                    .split(body_area);
+
+                    let shared_key_text = if app.is_shared_key_visible {
+                        app.shared_key_display.as_str()
                     } else {
-                        // In participant mode, show "You:" only if the message is from the sender
-                        if Some(*pubkey) == app.sender_keys.as_ref().map(|k| k.public_key()) {
-                            format!("You: {}", msg)
-                        } else {
-                            format!("{}: {}", pubkey.to_string(), msg)
-                        }
-                    }
-                })
-                .collect();
+                        &"*".repeat(64)
+                    };
 
-            // Display recent messages
-            let lines: Vec<Line> = recent_messages
-                .iter()
-                .map(|msg| Line::from(Span::raw(msg)))
-                .collect();
-            let messages_widget = Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .title_top(Line::from("Messages").alignment(Alignment::Left))
-                        .title_top(Line::from(Span::styled("ESC to exit", Style::default().fg(Color::Green))).alignment(Alignment::Right))
-                        .borders(Borders::ALL)
-                );
-            f.render_widget(messages_widget, chunks[0]);
+                    let shared_key_widget = Paragraph::new(shared_key_text)
+                        .style(Style::default().fg(Color::Gray))
+                        .block(
+                            Block::default()
+                                .title("Shared Private Key")
+                                .title_style(Style::new().fg(BLUE.c400))
+                                .title_top(Line::from(Span::styled("Tab to Display/Hide", Style::default().fg(Color::Green))).alignment(Alignment::Right))
+                                .borders(Borders::ALL)
+                        );
+                    f.render_widget(shared_key_widget, chunks[0]);
 
-            // Determine the text to display for the shared key
-            let shared_key_text = if app.is_shared_key_visible {
-                app.shared_key_display.as_str()
-            } else {
-                &"*".repeat(64)
-            };
-
-            // Display shared key with toggle label
-            let shared_key_widget = Paragraph::new(shared_key_text)
-                .style(Style::default().fg(Color::Cyan))
-                .block(
-                    Block::default()
-                        .title("Shared Private Key")
-                        // Add label "tab to display/hide" in the top-right corner
-                        .title_top(Line::from(Span::styled("Tab to Display/Hide", Style::default().fg(Color::Green))).alignment(Alignment::Right))
-                        .borders(Borders::ALL)
-                );
-            f.render_widget(shared_key_widget, chunks[1]);
-
-            // Determine the text to display for the shared public key
-            let shared_public_key_text = app.shared_keys.public_key().to_string();
-
-            // Display shared public key
-            let shared_public_key_widget = Paragraph::new(shared_public_key_text)
-                .style(Style::default().fg(Color::Cyan))
-                .block(
-                    Block::default()
-                        .title("Shared Public Key")                 
-                        .borders(Borders::ALL)
-                );
-            f.render_widget(shared_public_key_widget, chunks[2]);      
-
-
-
-            // Input field
-            let input = Paragraph::new(app.input.as_str())
-                .style(Style::default().fg(Color::Yellow))
-                .block(Block::default().title("Input").borders(Borders::ALL));
-            f.render_widget(input, chunks[3]);
+                    let shared_public_key_text = app.shared_keys.public_key().to_string();
+                    let shared_public_key_widget = Paragraph::new(shared_public_key_text)
+                        .style(Style::default().fg(Color::Gray))
+                        .block(
+                            Block::default()
+                                .title("Shared Public Key")
+                                .title_style(Style::new().fg(BLUE.c400))
+                                .borders(Borders::ALL)
+                        );
+                    f.render_widget(shared_public_key_widget, chunks[1]);
+                }
+                _ => {}
+            }
         })?;
 
         if event::poll(Duration::from_millis(100))? {
             if let CrosstermEvent::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Esc => break,
-                    KeyCode::Char(c) => app.input.push(c),
+                    KeyCode::Char(c) => {
+                        if app.selected_tab == 0 {
+                            app.input.push(c);
+                        }
+                    }
                     KeyCode::Backspace => {
-                        app.input.pop();
+                        if app.selected_tab == 0 {
+                            app.input.pop();
+                        }
                     }
                     KeyCode::Enter => {
-                        if !app.input.is_empty() {
+                        if app.selected_tab == 0 && !app.input.is_empty() {
                             let message = app.input.clone();
                             let now = Timestamp::now();
-                            // Use the sender's public key (from sender_keys) when sending a message in participant mode
                             let sender_pubkey = app.sender_keys.as_ref().map(|k| k.public_key()).unwrap_or(app.shared_keys.public_key());
                             {
                                 let mut messages = app.messages.lock().expect("Error locking messages");
@@ -265,9 +285,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app:
                             app.input.clear();
                         }
                     }
-                    // Toggle shared key visibility when Tab is pressed
                     KeyCode::Tab => {
                         app.is_shared_key_visible = !app.is_shared_key_visible;
+                    }
+                    KeyCode::Left => {
+                        if app.selected_tab > 0 {
+                            app.selected_tab -= 1;
+                        }
+                    }
+                    KeyCode::Right => {
+                        if app.selected_tab < 1 {
+                            app.selected_tab += 1;
+                        }
                     }
                     _ => {}
                 }
@@ -284,7 +313,6 @@ async fn run_nostr(
     messages: Arc<Mutex<Vec<(Timestamp, PublicKey, String)>>>,
     is_observer: bool,
 ) {
-    // Initialize Nostr client
     let client = Client::new(Keys::generate());
     if let Err(e) = client.add_relay(RELAY_URL).await {
         eprintln!("Error adding relay: {}", e);
@@ -292,7 +320,6 @@ async fn run_nostr(
     }
     let _ = client.connect().await;
 
-    // Subscribe to events directed to the shared key
     let filter = nostr_sdk::Filter::new()
         .kind(Kind::GiftWrap)
         .pubkey(shared_keys.public_key());
@@ -301,10 +328,9 @@ async fn run_nostr(
         return;
     }
 
-    // Handle outgoing messages (only in participant mode)
     if !is_observer {
         let client_clone = client.clone();
-        let receiver_clone = shared_keys.clone(); // Use shared_keys as receiver
+        let receiver_clone = shared_keys.clone();
         let sender = sender.expect("Sender keys are required in participant mode");
         if let Some(mut rx) = rx {
             tokio::spawn(async move {
@@ -317,7 +343,6 @@ async fn run_nostr(
         }
     }
 
-    // Handle incoming messages
     let mut notifications = client.notifications();
     while let Ok(notification) = notifications.recv().await {
         if let RelayPoolNotification::Event { event, .. } = notification {
@@ -343,18 +368,6 @@ async fn send_message(
     Ok(())
 }
 
-/// Wraps a message in a non-standard and simplified NIP-59 event.
-/// The inner event is signed with the sender's key and encrypted to the receiver's
-/// public key using an ephemeral key.
-///
-/// # Arguments
-/// - `sender`: The sender's keys for signing the inner event.
-/// - `receiver`: The receiver's public key for encryption.
-/// - `message`: The message to wrap.
-/// - `extra_tags`: Additional tags to include in the wrapper event.
-///
-/// # Returns
-/// A signed `Event` representing the NON STANDARD gift wrap.
 pub async fn mostro_wrap(
     sender: &Keys,
     receiver: PublicKey,
@@ -374,11 +387,9 @@ pub async fn mostro_wrap(
     )
     .unwrap();
 
-    // Build tags for the wrapper event
     let mut tags = vec![Tag::public_key(receiver)];
     tags.extend(extra_tags);
 
-    // Create and sign the gift wrap event
     let wrapped_event = EventBuilder::new(Kind::GiftWrap, encrypted_content)
         .pow(POW_DIFFICULTY)
         .tags(tags)
@@ -387,15 +398,6 @@ pub async fn mostro_wrap(
     Ok(wrapped_event)
 }
 
-/// Unwraps a non-standard NIP-59 event and retrieves the inner event.
-/// The receiver uses their private key to decrypt the content.
-///
-/// # Arguments
-/// - `receiver`: The receiver's keys for decryption.
-/// - `event`: The wrapped event to unwrap.
-///
-/// # Returns
-/// The decrypted inner `Event`.
 pub async fn mostro_unwrap(
     receiver: &Keys,
     event: Event,
@@ -403,7 +405,6 @@ pub async fn mostro_unwrap(
     let decrypted_content = nip44::decrypt(receiver.secret_key(), &event.pubkey, &event.content)?;
     let inner_event = Event::from_json(&decrypted_content)?;
 
-    // Verify the event before returning
     inner_event.verify()?;
 
     Ok(inner_event)
