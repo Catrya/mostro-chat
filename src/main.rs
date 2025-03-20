@@ -146,8 +146,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app:
     loop {
         terminal.draw(|f| {
             let chunks = Layout::vertical([
-                Constraint::Percentage(70), // Messages area
+                Constraint::Percentage(60), // Messages area
                 Constraint::Percentage(15), // Shared key area
+                Constraint::Percentage(10), // Shared public key area
                 Constraint::Percentage(15), // Input area
             ])
             .split(f.area());
@@ -204,18 +205,33 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app:
                 .style(Style::default().fg(Color::Cyan))
                 .block(
                     Block::default()
-                        .title("Shared Key")
+                        .title("Shared Private Key")
                         // Add label "tab to display/hide" in the top-right corner
                         .title_top(Line::from(Span::styled("Tab to Display/Hide", Style::default().fg(Color::Green))).alignment(Alignment::Right))
                         .borders(Borders::ALL)
                 );
             f.render_widget(shared_key_widget, chunks[1]);
 
+            // Determine the text to display for the shared public key
+            let shared_public_key_text = app.shared_keys.public_key().to_string();
+
+            // Display shared public key
+            let shared_public_key_widget = Paragraph::new(shared_public_key_text)
+                .style(Style::default().fg(Color::Cyan))
+                .block(
+                    Block::default()
+                        .title("Shared Public Key")                 
+                        .borders(Borders::ALL)
+                );
+            f.render_widget(shared_public_key_widget, chunks[2]);      
+
+
+
             // Input field
             let input = Paragraph::new(app.input.as_str())
                 .style(Style::default().fg(Color::Yellow))
                 .block(Block::default().title("Input").borders(Borders::ALL));
-            f.render_widget(input, chunks[2]);
+            f.render_widget(input, chunks[3]);
         })?;
 
         if event::poll(Duration::from_millis(100))? {
